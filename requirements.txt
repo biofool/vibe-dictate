@@ -1,0 +1,5 @@
+RealtimeSTT>=0.2.6
+# faster-whisper ships with RealtimeSTT; torch (silero VAD) and
+# sounddevice/pyaudio come in as its transitive deps.
+# System packages needed on Debian/Ubuntu:
+#   sudo apt install portaudio19-dev python3-dev
