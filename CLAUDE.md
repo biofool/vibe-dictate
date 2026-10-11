@@ -25,3 +25,8 @@ python3 dictate_ctl.py ptt|live|stop|status|quit
 - Typing/clipboard helpers must degrade gracefully: `wl-copy` -> `xclip`,
   `wtype` -> `ydotool` -> `xdotool` -> notify-only.
 - `0.0.0.0` is a bind address, not a connect address — never use it in URLs.
+- **Don't trust, verify** — post-edit lint hook runs automatically
+  (`.claude/hooks/post_edit_lint.py`); findings are defects, fix them.
+  Never claim done without a command that proves it (`verify-change` skill).
+- **Automate the annoying stuff** — a process explained twice becomes a
+  hook, a `scripts/` tool, or a `.devin/skills/` entry.
