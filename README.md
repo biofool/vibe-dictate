@@ -40,7 +40,12 @@ pip install -r requirements.txt
 ```bash
 python3 dictate_daemon.py         # or run via systemd --user, see below
 python3 dictate_ctl.py status     # check model/device/tool detection
+python3 dictate_ctl.py stop       # cancel the current session
+python3 dictate_ctl.py quit       # exit the daemon
 ```
+
+First run downloads the Whisper models from Hugging Face — this needs
+network once. After that everything is offline.
 
 | Shortcut | Action |
 |---|---|
