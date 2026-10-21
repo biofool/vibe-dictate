@@ -22,12 +22,10 @@ import logging
 import os
 import queue
 import shutil
-import socket
 import socketserver
 import subprocess
 import sys
 import threading
-import time
 import wave
 from datetime import datetime
 from pathlib import Path
