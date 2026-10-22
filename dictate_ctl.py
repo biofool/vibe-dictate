@@ -30,8 +30,13 @@ def main() -> int:
         s.settimeout(10)
         s.connect(str(SOCK))
         s.sendall(sys.argv[1].encode() + b"\n")
-        print(s.recv(4096).decode().strip())
-    return 0
+        reply = s.recv(4096)
+    if not reply:
+        print("daemon closed the connection without a reply", file=sys.stderr)
+        return 1
+    msg = reply.decode("utf-8", "replace").strip()
+    print(msg)
+    return 1 if msg.startswith("error:") else 0
 
 
 if __name__ == "__main__":

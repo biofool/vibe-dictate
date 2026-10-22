@@ -16,17 +16,16 @@ Commands (socket):
     quit    — exit the daemon
 """
 
+import fcntl
 import json
 import logging
 import os
 import queue
 import shutil
-import socket
 import socketserver
 import subprocess
 import sys
 import threading
-import time
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -48,7 +47,11 @@ COMPUTE = os.environ.get("VIBE_COMPUTE", "int8")
 
 SAMPLE_RATE = 16000
 
-IDLE, PTT, LIVE = "idle", "ptt", "live"
+IDLE, PTT, LIVE, FINISHING = "idle", "ptt", "live", "finishing"
+
+# ~25 chunks/sec at realtime_processing_pause=0.04 → 45k caps the queue near
+# 30 min of audio instead of growing ~115MB/h on a forgotten PTT session.
+PCM_QUEUE_MAX = 45_000
 
 
 def have(cmd: str) -> bool:
@@ -63,52 +66,45 @@ def notify(msg: str) -> None:
 
 
 def clipboard_set(text: str) -> bool:
-    if have("wl-copy"):
-        subprocess.run(["wl-copy"], input=text.encode(), check=False)
-        return True
-    if have("xclip"):
-        subprocess.run(["xclip", "-selection", "clipboard", "-in"],
-                       input=text.encode(), check=False)
-        return True
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard", "-in"]):
+        if have(cmd[0]) and subprocess.run(
+                cmd, input=text.encode(), check=False).returncode == 0:
+            return True
     return False
 
 
 def type_text(text: str) -> bool:
     """Type text into the focused field. wtype = Wayland, ydotool = universal."""
-    if have("wtype"):
-        subprocess.run(["wtype", "--", text], check=False)
-        return True
-    if have("ydotool"):
-        subprocess.run(["ydotool", "type", "--", text], check=False)
-        return True
-    if have("xdotool"):
-        subprocess.run(["xdotool", "type", "--clearmodifiers", "--", text], check=False)
-        return True
+    for cmd in (["wtype", "--", text],
+                ["ydotool", "type", "--", text],
+                ["xdotool", "type", "--clearmodifiers", "--", text]):
+        if have(cmd[0]) and subprocess.run(cmd, check=False).returncode == 0:
+            return True
     return False
 
 
 def paste_chord() -> bool:
     """Simulate Ctrl+V into the focused field."""
-    if have("wtype"):
-        subprocess.run(["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"], check=False)
-        return True
-    if have("ydotool"):
-        subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], check=False)
-        return True
-    if have("xdotool"):
-        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+v"], check=False)
-        return True
+    for cmd in (["wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl"],
+                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                ["xdotool", "key", "--clearmodifiers", "ctrl+v"]):
+        if have(cmd[0]) and subprocess.run(cmd, check=False).returncode == 0:
+            return True
     return False
 
 
 def save_pair(wav_path: Path, text: str, pcm: bytes) -> None:
+    # Transcripts can hold health/personal notes — keep them owner-only.
     if pcm:
         with wave.open(str(wav_path), "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(SAMPLE_RATE)
             w.writeframes(pcm)
-    wav_path.with_suffix(".txt").write_text(text + "\n", encoding="utf-8")
+        wav_path.chmod(0o600)
+    txt_path = wav_path.with_suffix(".txt")
+    txt_path.write_text(text + "\n", encoding="utf-8")
+    txt_path.chmod(0o600)
 
 
 class DictateDaemon:
@@ -116,7 +112,7 @@ class DictateDaemon:
         self.state = IDLE
         self.lock = threading.Lock()
         self.live_stop = threading.Event()
-        self.pcm_chunks: "queue.Queue[bytes | None]" = queue.Queue()
+        self.pcm_chunks: "queue.Queue[bytes | None]" = queue.Queue(maxsize=PCM_QUEUE_MAX)
         self.live_typed = 0  # chars already emitted for the live session
 
         from RealtimeSTT import AudioToTextRecorder  # heavy import, deferred
@@ -138,13 +134,18 @@ class DictateDaemon:
     # -- recorder callbacks -------------------------------------------------
 
     def _on_chunk(self, chunk: bytes) -> None:
-        self.pcm_chunks.put(chunk)
+        try:
+            self.pcm_chunks.put_nowait(chunk)
+        except queue.Full:
+            pass  # forgotten long session — drop audio rather than grow or block
 
     def _on_live_text(self, text: str) -> None:
         # Fires with stabilized realtime segments; type only in live mode.
-        if self.state == LIVE and text.strip():
-            type_text(text + " ")
+        with self.lock:
+            if self.state != LIVE or not text.strip():
+                return
             self.live_typed += len(text) + 1
+        type_text(text + " ")
 
     def _drain_pcm(self) -> bytes:
         parts = []
@@ -159,7 +160,9 @@ class DictateDaemon:
     def cmd_ptt(self) -> str:
         with self.lock:
             if self.state == PTT:
-                self.state = IDLE
+                # FINISHING (not IDLE) until _finish_ptt returns — a fast
+                # re-press must not start a new session mid-finish.
+                self.state = FINISHING
                 threading.Thread(target=self._finish_ptt, daemon=True).start()
                 return "ptt stopping"
             if self.state != IDLE:
@@ -171,57 +174,72 @@ class DictateDaemon:
             return "ptt recording"
 
     def _finish_ptt(self) -> None:
-        self.recorder.stop()
-        text = (self.recorder.text() or "").strip()
-        pcm = self._drain_pcm()
-        if not text:
-            notify("nothing transcribed")
-            return
-        stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        OUT_DIR.mkdir(parents=True, exist_ok=True)
-        save_pair(OUT_DIR / f"{stamp}.wav", text, pcm)
-        log.info("ptt transcript (%d chars) -> %s.*", len(text), stamp)
-        clipboard_set(text)
-        if not (type_text(text) or paste_chord()):
-            notify("transcript on clipboard — paste manually")
+        try:
+            self.recorder.stop()
+            text = (self.recorder.text() or "").strip()
+            pcm = self._drain_pcm()
+            if not text:
+                notify("nothing transcribed")
+                return
+            stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            OUT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            save_pair(OUT_DIR / f"{stamp}.wav", text, pcm)
+            log.info("ptt transcript (%d chars) -> %s.*", len(text), stamp)
+            clipboard_set(text)
+            if not (type_text(text) or paste_chord()):
+                notify("transcript on clipboard — paste manually")
+        except Exception as e:
+            log.exception("finish_ptt failed")
+            notify(f"transcription failed: {e}")
+        finally:
+            with self.lock:
+                self.state = IDLE
 
     def cmd_live(self) -> str:
         with self.lock:
             if self.state == LIVE:
                 self.state = IDLE
                 self.live_stop.set()
-                self.recorder.stop()
-                return "live stopped"
-            if self.state != IDLE:
+            elif self.state != IDLE:
                 return f"busy ({self.state})"
-            self.state = LIVE
-            self.live_stop.clear()
-            self.live_typed = 0
-            self._drain_pcm()
-            threading.Thread(target=self._run_live, daemon=True).start()
-            return "live dictation on"
+            else:
+                self.state = LIVE
+                self.live_stop.clear()
+                self.live_typed = 0
+                self._drain_pcm()
+                threading.Thread(target=self._run_live, daemon=True).start()
+                return "live dictation on"
+        self.recorder.stop()  # outside the lock — stop() can block
+        return "live stopped"
 
     def _run_live(self) -> None:
-        notify("live dictation — speak")
-        utterances = []
-        while not self.live_stop.is_set():
-            t = self.recorder.text()  # keep recorder fed; field text goes via callback
-            if t and t.strip():
-                utterances.append(t.strip())
-        pcm = self._drain_pcm()
-        text = " ".join(utterances)
-        if text:
-            stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-            OUT_DIR.mkdir(parents=True, exist_ok=True)
-            save_pair(OUT_DIR / f"{stamp}-live.wav", text, pcm)
-            clipboard_set(text)
-            log.info("live transcript (%d chars) -> %s-live.*", len(text), stamp)
-        log.info("live session ended")
+        try:
+            notify("live dictation — speak")
+            utterances = []
+            while not self.live_stop.is_set():
+                t = self.recorder.text()  # keep recorder fed; field text goes via callback
+                if t and t.strip():
+                    utterances.append(t.strip())
+            pcm = self._drain_pcm()
+            text = " ".join(utterances)
+            if text:
+                stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+                OUT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+                save_pair(OUT_DIR / f"{stamp}-live.wav", text, pcm)
+                clipboard_set(text)
+                log.info("live transcript (%d chars) -> %s-live.*", len(text), stamp)
+            log.info("live session ended")
+        except Exception as e:
+            log.exception("live session failed")
+            notify(f"live dictation failed: {e}")
 
     def cmd_stop(self) -> str:
         with self.lock:
             prev = self.state
-            self.state = IDLE
+            # FINISHING means _finish_ptt owns the recorder — leave state
+            # alone and let it return to IDLE when done.
+            if prev != FINISHING:
+                self.state = IDLE
         if prev == LIVE:
             self.live_stop.set()
         if prev in (PTT, LIVE):
@@ -239,7 +257,7 @@ class DictateDaemon:
 
 class CtlHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
-        cmd = self.rfile.readline().decode().strip()
+        cmd = self.rfile.readline(4096).decode("utf-8", "replace").strip()
         d = self.server.daemon  # type: ignore[attr-defined]
         fn = {"ptt": d.cmd_ptt, "live": d.cmd_live, "stop": d.cmd_stop,
               "status": d.cmd_status}.get(cmd)
@@ -247,7 +265,12 @@ class CtlHandler(socketserver.StreamRequestHandler):
             self.wfile.write(b"bye\n")
             threading.Thread(target=self.server.shutdown, daemon=True).start()
         elif fn:
-            self.wfile.write((fn() + "\n").encode())
+            try:
+                reply = fn()
+            except Exception as e:
+                log.exception("command %s failed", cmd)
+                reply = f"error: {e}"
+            self.wfile.write((reply + "\n").encode())
         else:
             self.wfile.write(f"unknown command: {cmd}\n".encode())
 
@@ -257,9 +280,18 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 
 
 def main() -> int:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(STATE_DIR, 0o700)
+    # Single-instance guard — a second daemon must not unlink the live socket.
+    lock_fd = open(STATE_DIR / "daemon.lock", "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log.error("another vibe-dictate daemon is already running — exiting")
+        return 1
     SOCK.unlink(missing_ok=True)
     srv = Server(str(SOCK), CtlHandler)
+    SOCK.chmod(0o600)  # socket is a command channel — owner only
     srv.daemon = DictateDaemon()  # type: ignore[attr-defined]
     log.info("listening on %s", SOCK)
     try:
